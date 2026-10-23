@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Plan with Codex, execute with dsh, independently verify, optionally commit."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import uuid
+
+HERE = Path(__file__).resolve().parent
+for folder in (HERE, HERE.parent / "bridge"):
+    if (folder / "dsh_runner.py").is_file():
+        sys.path.insert(0, str(folder))
+        break
+from dsh_runner import VERSION, DEFAULT_TIMEOUT, run_dsh, workspace_lock, WorkspaceBusy
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("-C", "--workdir", default=os.getcwd())
+    p.add_argument("-m", "--plan-model")
+    p.add_argument("-e", "--effort")
+    p.add_argument("-v", "--verify")
+    p.add_argument("--plan-only", action="store_true")
+    p.add_argument("--exec-only")
+    p.add_argument("--commit", action="store_true")
+    p.add_argument("--file", action="append", default=[], dest="files")
+    p.add_argument("--timeout-sec", type=int, default=DEFAULT_TIMEOUT)
+    p.add_argument("--verify-timeout", type=int, default=DEFAULT_TIMEOUT)
+    p.add_argument("--version", action="version", version=VERSION)
+    p.add_argument("task", nargs="*")
+    return p
+
+
+def git(root, *args):
+    proc = subprocess.run(["git", "--literal-pathspecs", "-C", str(root), *args], capture_output=True)
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.decode("utf-8", "replace").strip() or "git failed")
+    return proc.stdout
+
+
+def protected(path):
+    return any(part.casefold() == ".git" for part in path.parts) or bool(
+        path.parts and path.parts[0].casefold() == ".plan-exec")
+
+
+def internal(path):
+    return path == ".plan-exec" or path.startswith(".plan-exec/")
+
+
+def snapshot(root):
+    """Record dirty worktree state and staged objects, preserving user baselines."""
+    index = {}
+    for row in git(root, "ls-files", "--stage", "-z").split(b"\0"):
+        if row:
+            metadata, path = row.split(b"\t", 1)
+            index[os.fsdecode(path)] = metadata.decode("ascii")
+    result = {}
+    raw = git(root, "--no-optional-locks", "-c", "status.renames=false", "status",
+              "--porcelain=v1", "-z", "--untracked-files=all")
+    for row in raw.split(b"\0"):
+        if not row:
+            continue
+        path = os.fsdecode(row[3:])
+        if internal(path):
+            continue
+        file = root / path
+        if file.is_symlink():
+            digest = "symlink:" + os.readlink(file)
+        elif file.is_file():
+            h = hashlib.sha256()
+            with file.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    h.update(chunk)
+            digest = h.hexdigest()
+        else:
+            digest = "directory" if file.exists() else "missing"
+        result[path] = [row[:2].decode("ascii"), digest, index.get(path)]
+    return result
+
+
+def changed(before, after):
+    return sorted(path for path in before.keys() | after.keys()
+                  if before.get(path) != after.get(path))
+
+
+def command_run(command, root, folder, prefix, timeout, *, shell=False):
+    out, err = folder / (prefix + ".out"), folder / (prefix + ".err")
+    with out.open("wb") as stdout, err.open("wb") as stderr:
+        try:
+            proc = subprocess.Popen(command, cwd=root, shell=shell, stdout=stdout,
+                                    stderr=stderr, start_new_session=True)
+        except OSError as exc:
+            return {"exit_code": None, "status": "launch_error", "error": str(exc),
+                    "stdout": str(out), "stderr": str(err)}
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            return {"exit_code": proc.returncode, "status": "timed_out",
+                    "stdout": str(out), "stderr": str(err)}
+    return {"exit_code": proc.returncode, "status": "passed" if proc.returncode == 0 else "failed",
+            "stdout": str(out), "stderr": str(err)}
+
+
+def detect_verify(root):
+    # Do not infer "tests passed" merely from a language or build manifest.
+    if (root / "pytest.ini").is_file():
+        return "python3 -m pytest -q"
+    if (root / "pyproject.toml").is_file():
+        text = (root / "pyproject.toml").read_text()
+        if "[tool.pytest.ini_options]" in text:
+            return "python3 -m pytest -q"
+    if (root / "package.json").is_file():
+        data = json.loads((root / "package.json").read_text())
+        if data.get("scripts", {}).get("test"):
+            return "npm test --silent"
+    if (root / "go.mod").is_file():
+        return "go test ./..."
+    return None
+
+
+def history(root):
+    def optional(*args):
+        try:
+            return git(root, *args).decode().strip()
+        except RuntimeError:
+            return None
+    return {"head": optional("rev-parse", "--verify", "HEAD"),
+            "branch": optional("symbolic-ref", "--quiet", "HEAD")}
+
+
+def history_unchanged(root, baseline, report):
+    current = history(root)
+    if current != baseline:
+        report.update(status="scope_violation", error="Git HEAD or branch changed outside the commit step",
+                      history_before=baseline, history_after=current)
+        return False
+    return True
+
+
+def commit_preflight(root, allowed, *, initial):
+    # Hooks can mutate Git's temporary --only index and include unrelated staged work.
+    hooks = Path(os.fsdecode(git(root, "rev-parse", "--git-path", "hooks")).strip())
+    if not hooks.is_absolute():
+        hooks = root / hooks
+    for name in ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit",
+                 "reference-transaction", "post-rewrite", "post-index-change"):
+        if os.access(hooks / name, os.X_OK):
+            raise ValueError("Automatic commit refused: active Git hook " + name
+                             + "; run without --commit and commit manually")
+    tracked = set()
+    for row in git(root, "ls-files", "-v", "-z", "--", *allowed).split(b"\0"):
+        if not row:
+            continue
+        flag, path = chr(row[0]), os.fsdecode(row[2:])
+        tracked.add(path)
+        if flag == "S" or flag.islower():
+            raise ValueError("Commit target has skip-worktree/assume-unchanged flags: " + path)
+    if initial:
+        for path in allowed:
+            if path in tracked:
+                continue
+            target = root / path
+            if target.exists() or target.is_symlink():
+                raise ValueError("Commit target contains an existing untracked file: " + path)
+            ignored = subprocess.run(["git", "-C", str(root),
+                                      "check-ignore", "--quiet", "--", "./" + path], capture_output=True)
+            if ignored.returncode == 0:
+                raise ValueError("Commit target is ignored: " + path)
+            if ignored.returncode != 1:
+                raise RuntimeError("git check-ignore failed")
+
+
+def execute(args, root, folder, report, allowed, git_repo):
+    baseline_history = history(root) if git_repo else None
+    if args.commit:
+        commit_preflight(root, allowed, initial=True)
+    before = snapshot(root) if git_repo else {}
+    if args.commit:
+        dirty = sorted(set(allowed) & set(before))
+        if dirty:
+            report.update(status="invalid_input", error="Commit targets already contain user changes: "
+                          + ", ".join(dirty))
+            return
+    plan_path = folder / "PLAN.md"
+    if args.exec_only:
+        plan = Path(args.exec_only).expanduser()
+        if not plan.is_absolute():
+            plan = root / plan
+        text = plan.read_text(encoding="utf-8")
+        if not text.strip():
+            report.update(status="planning_failed", error="Plan is empty")
+            return
+        plan_path.write_text(text, encoding="utf-8")
+    else:
+        if not args.task:
+            report.update(status="invalid_input", error="A task is required")
+            return
+        prompt = ("只读分析并输出可执行方案，不修改文件，不输出完整实现代码。"
+                  "包含目标、现状、逐文件改动、验证命令和风险。"
+                  "\n允许修改的文件：" + json.dumps(allowed, ensure_ascii=False)
+                  + "\n任务：" + " ".join(args.task))
+        command = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+                   "--cd", str(root), "--output-last-message", str(plan_path)]
+        if args.plan_model:
+            command += ["-m", args.plan_model]
+        if args.effort:
+            command += ["-c", "model_reasoning_effort=" + json.dumps(args.effort)]
+        command.append(prompt)
+        report["planning"] = command_run(command, root, folder, "planning", args.timeout_sec)
+        if report["planning"]["status"] != "passed" or not plan_path.is_file() or not plan_path.read_text().strip():
+            report["status"] = "planning_failed"
+            return
+        text = plan_path.read_text(encoding="utf-8")
+    report["plan_path"] = str(plan_path)
+    if git_repo and not history_unchanged(root, baseline_history, report):
+        return
+    if args.plan_only:
+        report["status"] = "plan_only"
+        return
+    verification = args.verify if args.verify is not None else detect_verify(root)
+    prompt = ("## 目标\n" + (" ".join(args.task) or "按方案实施")
+              + "\n## 涉及文件\n" + json.dumps(allowed, ensure_ascii=False)
+              + "\n## 具体做法\n" + text
+              + "\n## 验收\n" + (verification or "执行器将此批标为未验证，不得宣称验收成功。")
+              + "\n## 禁止\n不得提交、推送、改全局设置或修改范围外文件。"
+              "发现方案冲突或检查失败需报告，不要无限重试。保留用户已有工作。")
+    report["worker"] = run_dsh(prompt, str(root), args.timeout_sec, lock=False)
+    if git_repo and not history_unchanged(root, baseline_history, report):
+        return
+    if args.commit:
+        commit_preflight(root, allowed, initial=False)
+    after = snapshot(root) if git_repo else {}
+    report["changed_files"] = changed(before, after)
+    report["baseline"] = before
+    if report["worker"]["status"] != "completed":
+        report["status"] = "execution_failed"
+        return
+    if allowed and set(report["changed_files"]) - set(allowed):
+        report["status"] = "scope_violation"
+        return
+    if not verification:
+        report["status"] = "unverified"
+        return
+    report["verification"] = command_run(
+        verification, root, folder, "verification", args.verify_timeout, shell=True)
+    report["verification"]["command"] = verification
+    if git_repo and not history_unchanged(root, baseline_history, report):
+        return
+    if args.commit:
+        commit_preflight(root, allowed, initial=False)
+    report["changed_files"] = changed(before, snapshot(root)) if git_repo else []
+    if report["verification"]["status"] != "passed":
+        report["status"] = "verification_failed"
+        return
+    if allowed and set(report["changed_files"]) - set(allowed):
+        report["status"] = "scope_violation"
+        return
+    if not args.commit:
+        report["status"] = "verified"
+        return
+    if not report["changed_files"]:
+        report["status"] = "no_changes"
+        return
+    try:
+        # Explicit paths only. --only keeps unrelated staged changes out of HEAD.
+        commit_paths = report["changed_files"]
+        git(root, "add", "--", *commit_paths)
+        git(root, "commit", "--only", "-m", "plan-exec: " + (" ".join(args.task) or "apply plan"),
+            "--", *commit_paths)
+        report["commit"] = git(root, "rev-parse", "HEAD").decode().strip()
+        report["status"] = "committed"
+    except RuntimeError as exc:
+        report.update(status="commit_failed", error=str(exc))
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    os.umask(0o077)
+    root = Path(args.workdir).expanduser().resolve()
+    report = {"version": VERSION, "status": "invalid_input", "worker": None,
+              "verification": {"status": "not_run", "exit_code": None, "command": args.verify},
+              "changed_files": []}
+    folder = None
+    try:
+        if not root.is_dir() or args.timeout_sec <= 0 or args.verify_timeout <= 0:
+            raise ValueError("Existing workdir and positive timeouts are required")
+        allowed = []
+        for item in args.files:
+            path = Path(item)
+            if (path.is_absolute() or ".." in path.parts or not path.parts
+                    or protected(path)):
+                raise ValueError("Invalid allowed file path: " + item)
+            target = root / path
+            if not target.resolve().is_relative_to(root):
+                raise ValueError("Allowed path escapes workdir: " + item)
+            if protected(target.resolve().relative_to(root)):
+                raise ValueError("Allowed path resolves to reserved metadata: " + item)
+            if target.is_dir():
+                raise ValueError("--file must name a file, not a directory")
+            normalized = path.as_posix()
+            if normalized not in allowed:
+                allowed.append(normalized)
+        if len(allowed) > 5 or (args.commit and not allowed):
+            raise ValueError("--commit requires 1 to 5 explicit --file paths")
+        try:
+            top = Path(os.fsdecode(git(root, "rev-parse", "--show-toplevel")).strip()).resolve()
+            git_repo = True
+        except RuntimeError:
+            top, git_repo = None, False
+        if args.commit and (not git_repo or top != root):
+            raise ValueError("--commit requires the Git repository root as workdir")
+        if git_repo and top != root:
+            raise ValueError("Use the Git repository root as workdir")
+        with workspace_lock(str(root)):
+            folder = root / ".plan-exec" / ("run-" + uuid.uuid4().hex)
+            folder.mkdir(mode=0o700, parents=True)
+            report["log_dir"] = str(folder)
+            execute(args, root, folder, report, allowed, git_repo)
+    except WorkspaceBusy as exc:
+        report.update(status="busy", error=str(exc))
+    except (OSError, ValueError, RuntimeError) as exc:
+        report.update(error=str(exc))
+    if folder is not None:
+        target = folder / "result.json"
+        temporary = folder / ".result.tmp"
+        temporary.write_text(json.dumps(report, ensure_ascii=True, indent=2) + "\n")
+        os.replace(temporary, target)
+    print(json.dumps(report, ensure_ascii=True))
+    return 0 if report["status"] in {"verified", "committed", "no_changes", "plan_only"} else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

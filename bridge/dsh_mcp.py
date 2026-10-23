@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Minimal synchronous stdio MCP adapter for dsh. Python standard library only."""
 import json
-import os
 from pathlib import Path
-import signal
-import subprocess
+import shutil
 import sys
-import time
 
-DEFAULT_TIMEOUT = 240
-MAX_CHARS = 20000
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import dsh_runner  # noqa: E402
+
+VERSION = dsh_runner.VERSION
+DEFAULT_TIMEOUT = dsh_runner.DEFAULT_TIMEOUT
 PROTOCOL_VERSION = "2024-11-05"
 
 _PROPERTIES = {
     "task": {"type": "string", "minLength": 1, "description": "自包含任务，含目标、文件、做法、验收和禁止事项。"},
     "workdir": {"type": "string", "description": "现有工作目录的绝对路径。"},
-    "timeout_sec": {"type": "integer", "minimum": 1, "description": "内部超时秒数，默认 240；应短于客户端外层超时。"},
+    "timeout_sec": {"type": "integer", "minimum": 1,
+                    "description": f"内部超时秒数，默认 {DEFAULT_TIMEOUT}；应短于客户端外层超时。"},
 }
 TOOLS = [
     {
@@ -31,107 +33,72 @@ TOOLS = [
             **_PROPERTIES, "session_id": {"type": "string", "minLength": 1}},
             "required": ["task", "workdir", "session_id"], "additionalProperties": False},
     },
+    {
+        "name": "dsh_bridge_info",
+        "description": "只读返回桥接版本、路径、Python、dsh 可执行文件和超时建议；不读取配置、不调用模型。",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
 ]
 
 
-def as_text(value):
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value or ""
+def bridge_info():
+    return {
+        "version": VERSION,
+        "bridge_path": str(Path(__file__).resolve()),
+        "runner_path": str(Path(dsh_runner.__file__).resolve()),
+        "python_executable": sys.executable,
+        "dsh_path": shutil.which("dsh"),
+        "node_path": shutil.which("node"),
+        "default_timeout_sec": DEFAULT_TIMEOUT,
+        "suggested_outer_timeout_sec": 300,
+    }
 
 
-def clip(value, limit=MAX_CHARS):
-    text = as_text(value)
-    if len(text) <= limit:
-        return text
-    half = limit // 2
-    return text[:half] + "\n... [truncated] ...\n" + text[-half:]
-
-
-def validate(name, arguments):
-    if not isinstance(name, str) or name not in {"dsh_run", "dsh_resume"}:
-        raise ValueError("Unknown tool")
-    if not isinstance(arguments, dict):
-        raise ValueError("arguments must be an object")
-    allowed = {"task", "workdir", "timeout_sec"}
-    if name == "dsh_resume":
-        allowed.add("session_id")
-    if set(arguments) - allowed:
-        raise ValueError("Unexpected argument")
-    task = arguments.get("task")
-    if not isinstance(task, str) or not task.strip():
-        raise ValueError("task must be a nonempty string")
-    workdir = arguments.get("workdir")
-    if not isinstance(workdir, str) or not Path(workdir).is_absolute():
-        raise ValueError("workdir must be an absolute path")
-    if not Path(workdir).is_dir():
-        raise ValueError("workdir must be an existing directory")
-    timeout = arguments.get("timeout_sec", DEFAULT_TIMEOUT)
-    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
-        raise ValueError("timeout_sec must be a positive integer")
-    if name == "dsh_resume":
-        sid = arguments.get("session_id")
-        if not isinstance(sid, str) or not sid.strip() or sid.startswith("-"):
-            raise ValueError("session_id must be a known nonempty ID, not an option")
-    return task, workdir, timeout
-
-
-def kill_worker(proc):
-    """Kill the process group on POSIX; detached processes may escape it."""
-    try:
-        if os.name == "posix":
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except ProcessLookupError:
-        pass
+def _invalid_input(message):
+    payload = {"version": VERSION, "status": "invalid_input", "error": message}
+    return True, json.dumps(payload, ensure_ascii=False)
 
 
 def run_tool(name, arguments):
-    try:
-        task, workdir, timeout = validate(name, arguments)
-    except (ValueError, OSError) as exc:
-        return True, str(exc)
-    cmd = ["dsh", "headless"]
+    if not isinstance(name, str):
+        return _invalid_input("tool name must be a string")
+    if name not in {"dsh_run", "dsh_resume", "dsh_bridge_info"}:
+        return _invalid_input(f"Unknown tool: {name}")
+    if not isinstance(arguments, dict):
+        return _invalid_input("arguments must be an object")
+    if name == "dsh_bridge_info":
+        if arguments:
+            return _invalid_input("dsh_bridge_info takes no arguments")
+        return False, json.dumps(bridge_info(), ensure_ascii=False)
+
+    allowed = {"task", "workdir", "timeout_sec"}
     if name == "dsh_resume":
-        cmd += ["--session-id", arguments["session_id"]]
-    cmd.append("-")
-    started = time.monotonic()
-    try:
-        proc = subprocess.Popen(
-            cmd, cwd=workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-            start_new_session=(os.name == "posix"),
-        )
-    except OSError as exc:
-        return True, f"Cannot start dsh; check PATH, installation and permissions: {exc}"
-    timed_out = False
-    try:
-        out, err = proc.communicate(task, timeout=timeout)
-    except subprocess.TimeoutExpired as first:
-        timed_out = True
-        kill_worker(proc)
-        try:
-            out, err = proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired as last:
-            # An escaped descendant may still hold the output pipes open.
-            out = last.output or first.output
-            err = last.stderr or first.stderr
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                if stream and not stream.closed:
-                    stream.close()
-            proc.wait(timeout=2)
-    elapsed = time.monotonic() - started
-    status = "TIMEOUT" if timed_out else f"exit={proc.returncode}"
-    parts = [f"{status} elapsed={elapsed:.1f}s workdir={workdir}",
-             "=== stdout ===\n" + clip(out),
-             "=== stderr ===\n" + clip(err, 3000)]
-    if timed_out:
-        parts.append("Partial changes may exist. Inspect files and running processes before retrying. "
-                     "Resume only with a verified session ID; none is inferred by this bridge.")
-    elif proc.returncode != 0:
-        parts.append("Inspect actual changes before retrying; failure does not imply no writes.")
-    return timed_out or proc.returncode != 0, "\n\n".join(parts)
+        allowed.add("session_id")
+    unexpected = set(arguments) - allowed
+    if unexpected:
+        names = ", ".join(sorted(map(str, unexpected)))
+        return _invalid_input(f"Unexpected argument(s): {names}")
+    missing = [key for key in ("task", "workdir") if key not in arguments]
+    if name == "dsh_resume" and "session_id" not in arguments:
+        missing.append("session_id")
+    if missing:
+        return _invalid_input(f"Missing required argument(s): {', '.join(missing)}")
+
+    workdir = arguments["workdir"]
+    if not isinstance(workdir, str) or not workdir or not Path(workdir).is_absolute():
+        return _invalid_input("workdir must be an absolute path")
+    if name == "dsh_resume":
+        session_id = arguments["session_id"]
+        if not isinstance(session_id, str) or not session_id.strip():
+            return _invalid_input("session_id must be a nonempty string")
+
+    result = dsh_runner.run_dsh(
+        arguments["task"],
+        workdir,
+        timeout_sec=arguments.get("timeout_sec", DEFAULT_TIMEOUT),
+        session_id=arguments.get("session_id"),
+    )
+    return result.get("status") != "completed", json.dumps(result, ensure_ascii=False)
 
 
 def rpc_error(request_id, code, message):
@@ -154,7 +121,7 @@ def dispatch(req):
     method = req["method"]
     if method == "initialize":
         result = {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}},
-                  "serverInfo": {"name": "codex-dsh-bridge", "version": "1.0.0"}}
+                  "serverInfo": {"name": "codex-dsh-bridge", "version": VERSION}}
     elif method == "ping":
         result = {}
     elif method == "tools/list":
