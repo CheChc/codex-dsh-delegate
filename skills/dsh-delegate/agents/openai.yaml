@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex 指挥，dsh 干活"
+  short_description: "Codex 规划与独立验收，dsh 按明确方案分批实现并修复"
+  default_prompt: "用 $dsh-delegate 先确定实现方案和验收标准，再委托 dsh 执行，由你审查差异并亲自复验。"
