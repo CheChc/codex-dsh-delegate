@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "purpose": "独立场景路由评审用例；不是自动触发成功率或执行器测试。评审只提供prompt与候选skill，不提供expected_route/reason。",
+  "routes": {
+    "delegate": "可先只读核实项目上下文，再在既定约束内委托实现，由Codex审查与独立验收。",
+    "plan_first": "Codex先澄清需求或作领域/架构判断；完成后才可能委托。",
+    "direct": "直接解释、做极小修改或走领域研究skill，不额外调用dsh。"
+  },
+  "cases": [
+    {
+      "id": "new_module",
+      "prompt": "给已有Python项目新增src/ranges.py和tests/test_ranges.py。实现merge_ranges(items)，接受整数闭区间，合并重叠或相邻区间，按起点升序输出；输入不被修改，反向区间抛ValueError，空输入返回[]，不加依赖。允许你选择内部算法，用unittest覆盖边界。",
+      "expected_route": "delegate",
+      "reason": "新增模块有明确契约和验收，不要求属于重复工作。"
+    },
+    {
+      "id": "new_cli",
+      "prompt": "给项目新增一个CSV转JSON Lines命令行工具，只修改tools/csv_to_jsonl.py和tests/test_csv_to_jsonl.py。UTF-8输入，首行为键，每行一个JSON对象；字段数不一致需非零退出且不覆盖已有输出，不加依赖。方案已确定，请完成实现并测试。",
+      "expected_route": "delegate",
+      "reason": "新工具可根据接口和异常边界直接委托实现。"
+    },
+    {
+      "id": "frontend_feature",
+      "prompt": "在已有React项目的src/TaskFilter.tsx和对应测试里新增状态筛选组件，选项为全部、进行中、已完成，回调onChange传枚举值；切换后焦点保留，沿用现有样式和测试工具，不改数据接口。请实现并验收。",
+      "expected_route": "delegate",
+      "reason": "组件需求和公共接口已确定，局部实现可由dsh完成。"
+    },
+    {
+      "id": "refactor",
+      "prompt": "把src/report.py里重复的日期格式化逻辑提取为私有函数，保持公开接口和所有输出不变，只改这个文件及tests/test_report.py。现有快照和边界测试必须通过。",
+      "expected_route": "delegate",
+      "reason": "范围和不变量明确的重构无需是机械替换。"
+    },
+    {
+      "id": "data_processing",
+      "prompt": "处理已经授权使用的本地records.csv，生成clean.csv和summary.json；按id去重并保留updated_at最新的一行，时间相同保留输入靠后项，空id计入拒绝数，保留原文件。无外部服务和新依赖，验收输入总数等于保留、重复和拒绝数之和。",
+      "expected_route": "delegate",
+      "reason": "输入、规则和结果可核验的数据处理适合委托。"
+    },
+    {
+      "id": "note_write",
+      "prompt": "内容和来源已经核实，note-organizer也已定位目标笔记与写入规范。请按确定的段落与引用映射补充两篇Markdown笔记，保留旧内容，检查双向链接、引用锚点和重复段落。",
+      "expected_route": "delegate",
+      "reason": "领域判断完成后，可委托按领域skill规范整理写入。"
+    },
+    {
+      "id": "bugfix",
+      "prompt": "tests/test_parser.py已有空字符串触发异常的复现。只修src/parser.py并补测试，空字符串返回已有EmptyResult，其他输入行为不变，运行现有unittest套件验收。",
+      "expected_route": "delegate",
+      "reason": "复现、期望与范围明确的修复仍是适用场景。"
+    },
+    {
+      "id": "mechanical_replace",
+      "prompt": "把指定四个配置文件中恰好各出现一次的old_flag改为new_flag，给定原文和SHA256，任何前置检查不匹配就停止，最后运行既有配置校验。",
+      "expected_route": "delegate",
+      "reason": "原有精确替换场景仍应保留。"
+    },
+    {
+      "id": "explain_only",
+      "prompt": "只解释Python生成器和普通函数的区别，给两个短例子，不要修改文件，也不要运行代码。",
+      "expected_route": "direct",
+      "reason": "纯解释无需为了使用委托而调用dsh。"
+    },
+    {
+      "id": "tiny_edit",
+      "prompt": "把README里的拼写recieve改为receive，就这一处。",
+      "expected_route": "direct",
+      "reason": "可直接完成的单处小改默认不增加委托开销。"
+    },
+    {
+      "id": "architecture_choice",
+      "prompt": "我还没决定用PostgreSQL还是MongoDB，也不知道数据模型和扩容需求，请替我比较并决定系统架构，先不要写代码。",
+      "expected_route": "plan_first",
+      "reason": "需求澄清与架构取舍由Codex承担，不交dsh决定。"
+    },
+    {
+      "id": "vague_app",
+      "prompt": "帮我做一个管理生活的应用，具体功能和技术栈你看着办。",
+      "expected_route": "plan_first",
+      "reason": "先收敛目标、接口、范围和可观察验收，再考虑委托实现。"
+    },
+    {
+      "id": "explicit_tiny_dsh",
+      "prompt": "用$dsh-delegate让dsh把README中唯一一处recieve改成receive，你来检查差异，不需要提交。",
+      "expected_route": "delegate",
+      "reason": "用户明确指定委托时，不用简单小改例外否定其选择。"
+    },
+    {
+      "id": "research_judgment",
+      "prompt": "请研究HBM4与HBM3E的架构差异，查官方来源并核实参数，先不写入笔记。",
+      "expected_route": "direct",
+      "reason": "优先hardware-learn研究与来源判断，不能把领域结论当成已定实现任务。"
+    }
+  ]
+}
